@@ -44,7 +44,7 @@ from crawled text), and website content cannot prompt-inject it. It is **not** a
 
 ## Setup and run
 ```bash
-git clone <your-repo-url> TaskPilot-AI
+git clone https://github.com/vishnuvardhan5337/TaskPilot-AI.git TaskPilot-AI
 cd TaskPilot-AI
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
