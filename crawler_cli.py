@@ -19,11 +19,20 @@ Safety built in (defence in depth - the CLI is safe even when run on its own):
     * crawling never leaves the original domain
     * robots.txt is honoured
     * hard caps: pages, bytes per page, per-request timeout, total time budget
+
+Engines
+    --engine requests   (default) plain HTTP + BeautifulSoup; fastest, strictest
+    --engine crawl4ai   headless Chromium via Crawl4AI so JavaScript-rendered pages work.
+                        The same network policy is enforced on EVERY browser request
+                        (navigation, redirects, sub-resources); if the policy cannot be
+                        installed the crawl is refused (fail closed).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ipaddress
+import os
 import json
 import socket
 import sys
@@ -62,6 +71,10 @@ class BlockedURL(Exception):
 
 class FetchError(Exception):
     """A page could not be fetched or parsed."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def log(msg: str) -> None:
@@ -229,6 +242,100 @@ def read_body_text(resp) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# --------------------------------------------------------------------------- browser engine
+class BrowserFetcher:
+    """Crawl4AI (headless Chromium) fetcher. Renders JavaScript; enforces the network policy."""
+
+    def __init__(self, timeout: float, validator):
+        try:
+            import asyncio
+            from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+        except ImportError:
+            raise FetchError("the crawl4ai engine is not installed (pip install crawl4ai && crawl4ai-setup)")
+        self._asyncio = asyncio
+        self._run_config_cls, self._cache_mode = CrawlerRunConfig, CacheMode
+        self.timeout = max(timeout, 20.0)
+        self.validator = validator
+        self.loop = asyncio.new_event_loop()
+        self.crawler = AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False))
+        try:
+            self.crawler.crawler_strategy.set_hook("on_page_context_created", self._policy_hook)
+        except Exception as exc:  # fail closed: never browse without the network policy
+            raise FetchError(f"cannot enforce the network policy in the browser ({type(exc).__name__})")
+        try:
+            self.loop.run_until_complete(self.crawler.start())
+        except Exception as exc:
+            raise FetchError(f"could not start the browser ({type(exc).__name__}); run crawl4ai-setup")
+
+    async def _policy_hook(self, page, context, **kwargs):
+        verdicts: dict = {}
+
+        async def handler(route):
+            url = route.request.url
+            if not url.lower().startswith(("http://", "https://")):
+                await route.continue_()  # data:, blob:, about: carry no network access
+                return
+            host = urlparse(url).hostname or ""
+            if host not in verdicts:
+                try:
+                    self.validator(url)
+                    verdicts[host] = True
+                except BlockedURL:
+                    verdicts[host] = False
+            if verdicts[host]:
+                await route.continue_()
+            else:
+                log(f"  browser request blocked by policy: {host}")
+                await route.abort("blockedbyclient")
+
+        await context.route("**", handler)
+        return page
+
+    def get(self, url: str, site: str):
+        self.validator(url)
+        cfg = self._run_config_cls(cache_mode=self._cache_mode.BYPASS,
+                                   page_timeout=int(self.timeout * 1000),
+                                   delay_before_return_html=1.0)
+        try:
+            result = self.loop.run_until_complete(
+                self._asyncio.wait_for(self.crawler.arun(url=url, config=cfg), self.timeout + 15))
+        except self._asyncio.TimeoutError:
+            raise FetchError("browser timed out")
+        except Exception as exc:
+            raise FetchError(f"browser error ({type(exc).__name__})")
+        status = getattr(result, "status_code", None)
+        if not getattr(result, "success", False):
+            raise FetchError(getattr(result, "error_message", None) or "browser could not load the page", status)
+        final = getattr(result, "redirected_url", None) or getattr(result, "url", None) or url
+        self.validator(final)
+        if site_key(urlparse(final).hostname) != site:
+            raise BlockedURL(f"{urlparse(final).hostname} is outside the original domain")
+        if status and status >= 400:
+            raise FetchError(f"HTTP {status}", status)
+        html = getattr(result, "html", "") or ""
+        return status or 200, final, html.encode("utf-8", "replace")[:MAX_BYTES]
+
+    def close(self):
+        try:
+            self.loop.run_until_complete(self.crawler.close())
+        except Exception:
+            pass
+        finally:
+            self.loop.close()
+
+
+def get_page(session, browser, url, site, timeout, validator):
+    """Fetch one page with either engine. Returns (http_status, final_url, body_bytes)."""
+    if browser is not None:
+        return browser.get(url, site)
+    resp, final_url = fetch(session, url, site, timeout, validator)
+    code = resp.status_code
+    if code >= 400:
+        resp.close()
+        raise FetchError(f"HTTP {code}", code)
+    return code, final_url, read_body(resp)
+
+
 # --------------------------------------------------------------------------- extraction
 def clean(text: str) -> str:
     return " ".join(text.split())
@@ -318,7 +425,7 @@ def _blank_page(url: str) -> dict:
 
 
 def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
-          session=None, validator=validate_url) -> dict:
+          session=None, validator=validate_url, engine="requests") -> dict:
     started = time.monotonic()
     session = session or make_session()
     start_url = validator(start_url)
@@ -326,6 +433,17 @@ def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
     log(f"start: {start_url} (max {max_pages} pages, same domain only)")
 
     robots = load_robots(session, start_url, site, timeout, validator)
+    browser = BrowserFetcher(timeout, validator) if engine == "crawl4ai" else None
+    try:
+        return _crawl_loop(start_url, max_pages, timeout, max_seconds, delay, session, validator,
+                           site, robots, browser, started, engine)
+    finally:
+        if browser is not None:
+            browser.close()
+
+
+def _crawl_loop(start_url, max_pages, timeout, max_seconds, delay, session, validator,
+                site, robots, browser, started, engine) -> dict:
     queue, queued = deque([start_url]), {url_key(start_url)}
     visited_final: set = set()
     pages, attempts = [], 0
@@ -348,21 +466,17 @@ def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
         log(f"[{attempts}/{max_pages}] GET {url}")
         page = _blank_page(url)
         try:
-            resp, final_url = fetch(session, url, site, timeout, validator)
-            page["http_status"] = resp.status_code
+            code, final_url, body = get_page(session, browser, url, site, timeout, validator)
+            page["http_status"] = code
             fkey = url_key(final_url)
             if fkey in visited_final:
-                resp.close()
                 attempts -= 1
                 log("  duplicate of an already-crawled page - skipped")
                 continue
             visited_final.add(fkey)
             if final_url != url:
                 page["final_url"] = final_url
-            if resp.status_code >= 400:
-                resp.close()
-                raise FetchError(f"HTTP {resp.status_code}")
-            fields, internal = extract(read_body(resp), final_url, site)
+            fields, internal = extract(body, final_url, site)
             page.update(fields)
             page.update(status="ok", error=None)
             log(f"  ok: {fields['title']!r}, {fields['word_count']} words, "
@@ -373,6 +487,8 @@ def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
                     queued.add(key)
                     queue.append(link)
         except (BlockedURL, FetchError) as exc:
+            if isinstance(exc, FetchError) and exc.status:
+                page["http_status"] = exc.status
             page["error"] = str(exc)
             log(f"  failed: {exc}")
         pages.append(page)
@@ -392,6 +508,7 @@ def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
     return {
         "status": status,
         "start_url": start_url,
+        "engine": engine,
         "domain": site,
         "max_pages": max_pages,
         "pages_crawled": len(ok),
@@ -406,8 +523,10 @@ def crawl(start_url, max_pages, timeout=10, max_seconds=90, delay=0.5,
 
 # --------------------------------------------------------------------------- CLI
 def emit(doc: dict) -> None:
-    sys.stdout.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """Write the single JSON result to the REAL stdout (libraries may have hijacked sys.stdout)."""
+    out = sys.__stdout__
+    out.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    out.flush()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -418,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--url", required=True, help="http(s) URL to start from")
     ap.add_argument("--max-pages", type=int, default=3, help=f"pages to crawl (1-{HARD_MAX_PAGES}, default 3)")
     ap.add_argument("--output", choices=["json"], default="json", help="output format")
+    ap.add_argument("--engine", choices=["requests", "crawl4ai"], default="requests",
+                    help="requests (default, fast) or crawl4ai (headless browser, renders JavaScript)")
     ap.add_argument("--timeout", type=float, default=10.0, help="per-request timeout in seconds")
     ap.add_argument("--max-seconds", type=float, default=90.0, help="total time budget in seconds")
     return ap
@@ -428,8 +549,17 @@ def main(argv=None) -> int:
     max_pages = max(1, min(args.max_pages, HARD_MAX_PAGES))
     if max_pages != args.max_pages:
         log(f"--max-pages clamped to {max_pages}")
+    os.environ.setdefault("CRAWL4AI_NO_CLOUD_NOTICE", "1")
     try:
-        result = crawl(args.url, max_pages, timeout=args.timeout, max_seconds=args.max_seconds)
+        # Third-party libraries (Crawl4AI) print progress to stdout: route it to stderr so that
+        # stdout stays exactly one JSON document.
+        with contextlib.redirect_stdout(sys.stderr):
+            result = crawl(args.url, max_pages, timeout=args.timeout, max_seconds=args.max_seconds,
+                           engine=args.engine)
+    except FetchError as exc:
+        log(f"cannot start: {exc}")
+        emit({"status": "failed", "start_url": args.url, "error": str(exc), "pages": []})
+        return EXIT_FAILED
     except BlockedURL as exc:
         log(f"refused: {exc}")
         emit({"status": "failed", "start_url": args.url, "error": f"URL refused: {exc}", "pages": []})

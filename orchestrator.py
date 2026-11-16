@@ -23,12 +23,16 @@ from pathlib import Path
 CLI_PATH = Path(__file__).resolve().with_name("crawler_cli.py")
 SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "TMPDIR",
                  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-                 "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+                 "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PLAYWRIGHT_BROWSERS_PATH")
+ENGINES = ("requests", "crawl4ai")
 EXIT_STATUS = {0: "success", 4: "partial"}
 
 
-def build_command(url: str, max_pages: int) -> list:
-    return [sys.executable, str(CLI_PATH), "--url", url, "--max-pages", str(int(max_pages)), "--output", "json"]
+def build_command(url: str, max_pages: int, engine: str = "requests") -> list:
+    if engine not in ENGINES:  # never let free text choose what gets executed
+        raise ValueError(f"unsupported engine {engine!r}")
+    return [sys.executable, str(CLI_PATH), "--url", url, "--max-pages", str(int(max_pages)),
+            "--output", "json", "--engine", engine]
 
 
 def display_command(cmd: list) -> str:
@@ -36,13 +40,17 @@ def display_command(cmd: list) -> str:
     return shlex.join(shown)
 
 
-def run_crawler(url: str, max_pages: int, timeout: float = 120, on_log=None, cmd: list | None = None) -> dict:
-    """Start the CLI, stream its stderr to `on_log(stream, line)`, return a run record."""
-    cmd = cmd or build_command(url, max_pages)
+def run_crawler(url: str, max_pages: int, timeout: float = 120, on_log=None, cmd: list | None = None,
+                engine: str = "requests", cancel_event=None) -> dict:
+    """Start the CLI, stream its stderr to `on_log(stream, line)`, return a run record.
+
+    `cancel_event` (threading.Event) lets another thread stop the run: the process is killed.
+    """
+    cmd = cmd or build_command(url, max_pages, engine)
     env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_KEYS}
     env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
     record = {"command": display_command(cmd), "exit_code": None, "stdout": "", "stderr": "",
-              "duration": 0.0, "timed_out": False, "spawn_error": None}
+              "duration": 0.0, "timed_out": False, "cancelled": False, "spawn_error": None}
     started = time.monotonic()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -67,6 +75,10 @@ def run_crawler(url: str, max_pages: int, timeout: float = 120, on_log=None, cmd
     open_streams = 2
     try:
         while open_streams:
+            if cancel_event is not None and cancel_event.is_set():
+                record["cancelled"] = True
+                proc.kill()
+                break
             if time.monotonic() - started > timeout:
                 record["timed_out"] = True
                 proc.kill()
@@ -107,6 +119,8 @@ def validate_result(run: dict) -> dict:
     """Turn a raw run record into {status, data, problem}. Never claims success without evidence."""
     if run.get("spawn_error"):
         return {"status": "failed", "data": None, "problem": run["spawn_error"]}
+    if run.get("cancelled"):
+        return {"status": "failed", "data": None, "problem": "The task was cancelled; the crawler process was stopped."}
     if run.get("timed_out"):
         return {"status": "failed", "data": None,
                 "problem": f"The crawler did not finish in time and was stopped after {run['duration']}s."}

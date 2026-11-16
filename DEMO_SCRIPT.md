@@ -10,3 +10,12 @@ Test the mandatory prompt once beforehand so you know it works on your network.
 5. **Second site (0:30)** — "Summarize https://quotes.toscrape.com and crawl up to 3 pages" to show multi-page crawling.
 6. **Edge cases (0:45)** — run `Crawl http://localhost:8501` (blocked, exit code 2) and the non-existent domain (honest failure). Mention timeout/kill, partial status, robots.txt.
 7. **Stack + AI disclosure (0:30)** — Python, Streamlit, Requests, BeautifulSoup, subprocess. "I used Claude and ChatGPT for planning and coding help; no LLM API is called at runtime; the AI layer is rule-based plus an extractive summariser, which I chose deliberately for safety and zero cost."
+
+
+## Added segment if the Groq LLM is enabled (about 45 seconds, after the multi-page demo)
+Start the app with `export GROQ_API_KEY=...` set (do NOT show the key on screen).
+1. Point at the sidebar: "The Groq toggle is on and shows the model name."
+2. Run the multi-page crawl. Show the summary with the "Summarised by Groq" caption, the answer box and the key facts.
+3. Type a follow-up with no URL: `What are the main topics on that site?` and show the answer.
+4. Say: "The LLM only sees the crawled text, treats it as untrusted data and can only return a JSON summary. It never chooses commands or URLs. If Groq is down or the key is missing, the app falls back to the extractive summary and says so."
+5. Update the disclosure: "Runtime AI: an optional Groq-hosted model; planning and coding help from Claude and ChatGPT."
